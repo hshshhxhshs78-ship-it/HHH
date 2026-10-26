@@ -1,0 +1,441 @@
+#!/usr/bin/env python3
+"""
+sovitx_android_audit.py — Termux-native Android self-exposure audit.
+
+Reads /proc/net/{tcp,tcp6,udp,udp6}, `pm list packages -3`, `dumpsys package`,
+and `getprop`. No root, no network egress, own device only.
+
+    pkg install python
+    python sovitx_android_audit.py --json
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import socket
+import subprocess
+import sys
+from dataclasses import dataclass, field, asdict
+from datetime import datetime, timezone
+from pathlib import Path
+
+SEVERITY_ORDER = {"INFO": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
+
+DANGEROUS_PERMISSIONS = frozenset({
+    "android.permission.CAMERA",
+    "android.permission.RECORD_AUDIO",
+    "android.permission.READ_CONTACTS",
+    "android.permission.WRITE_CONTACTS",
+    "android.permission.READ_SMS",
+    "android.permission.SEND_SMS",
+    "android.permission.RECEIVE_SMS",
+    "android.permission.READ_CALL_LOG",
+    "android.permission.WRITE_CALL_LOG",
+    "android.permission.CALL_PHONE",
+    "android.permission.PROCESS_OUTGOING_CALLS",
+    "android.permission.ANSWER_PHONE_CALLS",
+    "android.permission.READ_PHONE_STATE",
+    "android.permission.READ_PHONE_NUMBERS",
+    "android.permission.ACCESS_FINE_LOCATION",
+    "android.permission.ACCESS_COARSE_LOCATION",
+    "android.permission.ACCESS_BACKGROUND_LOCATION",
+    "android.permission.READ_EXTERNAL_STORAGE",
+    "android.permission.WRITE_EXTERNAL_STORAGE",
+    "android.permission.READ_MEDIA_IMAGES",
+    "android.permission.READ_MEDIA_VIDEO",
+    "android.permission.READ_MEDIA_AUDIO",
+    "android.permission.BODY_SENSORS",
+    "android.permission.ACTIVITY_RECOGNITION",
+    "android.permission.BLUETOOTH_CONNECT",
+    "android.permission.BLUETOOTH_SCAN",
+    "android.permission.NEARBY_WIFI_DEVICES",
+    "android.permission.ACCESS_MEDIA_LOCATION",
+    "android.permission.UWB_RANGING",
+})
+
+SENSITIVE_SPECIAL = frozenset({
+    "android.permission.SYSTEM_ALERT_WINDOW",
+    "android.permission.REQUEST_INSTALL_PACKAGES",
+    "android.permission.BIND_ACCESSIBILITY_SERVICE",
+    "android.permission.QUERY_ALL_PACKAGES",
+    "android.permission.PACKAGE_USAGE_STATS",
+    "android.permission.WRITE_SETTINGS",
+    "android.permission.MANAGE_EXTERNAL_STORAGE",
+})
+
+TCP_STATE = {
+    "01": "ESTABLISHED", "02": "SYN_SENT", "03": "SYN_RECV",
+    "04": "FIN_WAIT1", "05": "FIN_WAIT2", "06": "TIME_WAIT",
+    "07": "CLOSE", "08": "CLOSE_WAIT", "09": "LAST_ACK",
+    "0A": "LISTEN", "0B": "CLOSING",
+}
+
+LOOPBACK_PREFIXES = ("127.", "::1", "0.0.0.0", "::")
+
+
+@dataclass
+class Finding:
+    severity: str
+    category: str
+    subject: str
+    detail: str
+
+
+@dataclass
+class Report:
+    generated: str
+    device: dict = field(default_factory=dict)
+    findings: list = field(default_factory=list)
+    sockets: list = field(default_factory=list)
+    packages: list = field(default_factory=list)
+
+
+def run(cmd: list[str], timeout: float = 25.0) -> str:
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout, check=False
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, PermissionError):
+        return ""
+    return proc.stdout or ""
+
+
+def getprop() -> dict[str, str]:
+    props = {}
+    for line in run(["getprop"]).splitlines():
+        m = re.match(r"\[([^\]]+)\]: \[([^\]]*)\]", line)
+        if m:
+            props[m.group(1)] = m.group(2)
+    return props
+
+
+def decode_endpoint(token: str) -> tuple[str, int]:
+    addr_hex, port_hex = token.split(":", 1)
+    port = int(port_hex, 16)
+    if len(addr_hex) == 8:
+        ip = socket.inet_ntoa(bytes.fromhex(addr_hex)[::-1])
+    elif len(addr_hex) == 32:
+        words = [addr_hex[i:i + 8] for i in range(0, 32, 8)]
+        raw = b"".join(bytes.fromhex(w)[::-1] for w in words)
+        ip = socket.inet_ntop(socket.AF_INET6, raw)
+    else:
+        ip = addr_hex
+    return ip, port
+
+
+def read_sockets() -> list[dict]:
+    entries = []
+    for proto, path in (
+        ("tcp", "/proc/net/tcp"), ("tcp6", "/proc/net/tcp6"),
+        ("udp", "/proc/net/udp"), ("udp6", "/proc/net/udp6"),
+    ):
+        p = Path(path)
+        if not p.exists():
+            continue
+        try:
+            lines = p.read_text().splitlines()[1:]
+        except (PermissionError, OSError):
+            continue
+        for line in lines:
+            parts = line.split()
+            if len(parts) < 10:
+                continue
+            try:
+                local_ip, local_port = decode_endpoint(parts[1])
+                remote_ip, remote_port = decode_endpoint(parts[2])
+            except (ValueError, OSError):
+                continue
+            state = (
+                TCP_STATE.get(parts[3].upper(), parts[3])
+                if proto.startswith("tcp") else "OPEN"
+            )
+            entries.append({
+                "proto": proto,
+                "local_ip": local_ip,
+                "local_port": local_port,
+                "remote_ip": remote_ip,
+                "remote_port": remote_port,
+                "state": state,
+                "uid": int(parts[7]),
+                "inode": parts[9],
+            })
+    return entries
+
+
+def third_party_packages() -> set[str]:
+    out = run(["pm", "list", "packages", "-3"])
+    return {
+        line.split(":", 1)[1].strip()
+        for line in out.splitlines()
+        if line.startswith("package:") and ":" in line
+    }
+
+
+PACKAGE_HEADER = re.compile(r"^\s*Package \[([A-Za-z0-9_.]+)\]")
+USER_ID = re.compile(r"userId=(\d+)")
+TARGET_SDK = re.compile(r"targetSdk=(\d+)")
+FLAGS_LINE = re.compile(r"^\s*flags=\[(.*)\]\s*$")
+GRANTED_LINE = re.compile(r"^\s*([A-Za-z0-9_.]+):\s+granted=true")
+COMPONENT_TOKEN = re.compile(r"([A-Za-z][A-Za-z0-9_.]*/[A-Za-z0-9_.$]+)")
+
+
+def split_package_blocks(dump: str) -> dict[str, str]:
+    blocks: dict[str, list[str]] = {}
+    current = None
+    for line in dump.splitlines():
+        m = PACKAGE_HEADER.match(line)
+        if m:
+            current = m.group(1)
+            blocks[current] = [line]
+        elif current is not None:
+            blocks[current].append(line)
+    return {name: "\n".join(body) for name, body in blocks.items()}
+
+
+def parse_exported(block: str, pkg: str) -> list[str]:
+    lines = block.splitlines()
+    components: list[str] = []
+    for idx, line in enumerate(lines):
+        if "exported=true" not in line:
+            continue
+        name = None
+        for back in range(idx, max(-1, idx - 10), -1):
+            m = COMPONENT_TOKEN.search(lines[back])
+            if m:
+                name = m.group(1)
+                break
+        if name is None:
+            name = f"{pkg}/<unresolved>"
+        if name not in components:
+            components.append(name)
+    return components
+
+
+def audit_package(pkg: str, block: str, findings: list[Finding]) -> dict:
+    granted = set()
+    for line in block.splitlines():
+        m = GRANTED_LINE.match(line)
+        if m:
+            granted.add(m.group(1))
+
+    uid_m = USER_ID.search(block)
+    sdk_m = TARGET_SDK.search(block)
+    debuggable = False
+    for line in block.splitlines():
+        fm = FLAGS_LINE.match(line)
+        if fm and "DEBUGGABLE" in fm.group(1):
+            debuggable = True
+            break
+
+    dangerous = sorted(granted & DANGEROUS_PERMISSIONS)
+    special = sorted(granted & SENSITIVE_SPECIAL)
+    exported = parse_exported(block, pkg)
+
+    if debuggable:
+        findings.append(Finding(
+            "HIGH", "debuggable", pkg,
+            "app has android:debuggable=true — attachable by any local ADB peer",
+        ))
+
+    if exported:
+        sev = "CRITICAL" if dangerous else "HIGH"
+        findings.append(Finding(
+            sev, "exported", pkg,
+            f"{len(exported)} exported component(s): {', '.join(exported[:4])}"
+            + (" …" if len(exported) > 4 else ""),
+        ))
+
+    if dangerous:
+        findings.append(Finding(
+            "MEDIUM", "permissions", pkg,
+            f"dangerous granted: {', '.join(p.split('.')[-1] for p in dangerous)}",
+        ))
+
+    if special:
+        findings.append(Finding(
+            "MEDIUM", "special", pkg,
+            f"special access: {', '.join(p.split('.')[-1] for p in special)}",
+        ))
+
+    return {
+        "package": pkg,
+        "uid": int(uid_m.group(1)) if uid_m else None,
+        "target_sdk": int(sdk_m.group(1)) if sdk_m else None,
+        "debuggable": debuggable,
+        "exported": exported,
+        "dangerous_permissions": dangerous,
+        "special_permissions": special,
+    }
+
+
+def audit_sockets(sockets: list[dict], uid_map: dict[int, str], findings: list[Finding]) -> None:
+    for s in sockets:
+        if s["state"] not in ("LISTEN", "OPEN"):
+            continue
+        ip = s["local_ip"]
+        port = s["local_port"]
+        owner = uid_map.get(s["uid"], f"uid:{s['uid']}")
+        wildcard = ip in ("0.0.0.0", "::")
+        loopback = ip.startswith("127.") or ip == "::1"
+        if wildcard:
+            findings.append(Finding(
+                "HIGH", "socket", f"{s['proto']} {ip}:{port}",
+                f"listening on all interfaces — owner {owner}",
+            ))
+        elif not loopback:
+            findings.append(Finding(
+                "MEDIUM", "socket", f"{s['proto']} {ip}:{port}",
+                f"listening on routable address — owner {owner}",
+            ))
+        else:
+            findings.append(Finding(
+                "LOW", "socket", f"{s['proto']} {ip}:{port}",
+                f"loopback listener — owner {owner}",
+            ))
+
+
+def audit_props(props: dict[str, str], findings: list[Finding]) -> None:
+    adb_port = props.get("service.adb.tcp.port") or props.get("persist.adb.tcp.port")
+    if adb_port and adb_port not in ("", "-1", "0"):
+        findings.append(Finding(
+            "CRITICAL", "adb", f"tcp port {adb_port}",
+            "ADB is listening over the network — any host that reaches this port owns the device",
+        ))
+    if props.get("ro.debuggable") == "1":
+        findings.append(Finding(
+            "CRITICAL", "build", "ro.debuggable=1",
+            "debug build — root-capable ADB shell available to any authorized peer",
+        ))
+    if props.get("ro.secure") == "0":
+        findings.append(Finding(
+            "HIGH", "build", "ro.secure=0",
+            "adbd runs as root by default on this image",
+        ))
+
+
+def build_report(include_system: bool) -> Report:
+    props = getprop()
+    report = Report(
+        generated=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        device={
+            "model": props.get("ro.product.model", "unknown"),
+            "release": props.get("ro.build.version.release", "unknown"),
+            "sdk": props.get("ro.build.version.sdk", "unknown"),
+            "build_type": props.get("ro.build.type", "unknown"),
+            "fingerprint": props.get("ro.build.fingerprint", "unknown"),
+        },
+    )
+
+    audit_props(props, report.findings)
+
+    scoped = third_party_packages()
+    dump = run(["dumpsys", "package"], timeout=60.0)
+    blocks = split_package_blocks(dump)
+
+    uid_map: dict[int, str] = {}
+    for pkg, block in blocks.items():
+        if not include_system and pkg not in scoped:
+            continue
+        info = audit_package(pkg, block, report.findings)
+        report.packages.append(info)
+        if info["uid"] is not None:
+            uid_map[info["uid"]] = pkg
+
+    report.sockets = read_sockets()
+    audit_sockets(report.sockets, uid_map, report.findings)
+
+    if not blocks:
+        report.findings.append(Finding(
+            "INFO", "collector", "dumpsys package",
+            "empty dump — run from Termux shell with `pm` and `dumpsys` on PATH",
+        ))
+
+    report.packages.sort(key=lambda p: p["package"])
+    report.findings.sort(
+        key=lambda f: (-SEVERITY_ORDER[f.severity], f.category, f.subject)
+    )
+    return report
+
+
+def render_text(report: Report, min_severity: str) -> str:
+    d = report.device
+    counts = {}
+    for f in report.findings:
+        counts[f.severity] = counts.get(f.severity, 0) + 1
+    sev_line = "  ".join(
+        f"{name}={counts[name]}"
+        for name in ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO")
+        if counts.get(name)
+    )
+
+    lines = [
+        f"SOVITX ANDROID SELF-AUDIT   {report.generated}",
+        f"device    {d['model']}  Android {d['release']}  sdk {d['sdk']}  build {d['build_type']}",
+        f"fingerprint  {d['fingerprint']}",
+        f"scope     packages={len(report.packages)}  sockets={len(report.sockets)}  findings={len(report.findings)}",
+        f"severity  {sev_line or 'none'}",
+        "",
+    ]
+
+    header = f"{'SEV':<9}{'CATEGORY':<14}{'SUBJECT':<36}DETAIL"
+    lines.append(header)
+    lines.append("-" * (len(header) + 40))
+
+    threshold = SEVERITY_ORDER[min_severity]
+    shown = 0
+    for f in report.findings:
+        if SEVERITY_ORDER[f.severity] < threshold:
+            continue
+        subject = f.subject if len(f.subject) <= 34 else f.subject[:31] + "..."
+        lines.append(f"{f.severity:<9}{f.category:<14}{subject:<36}{f.detail}")
+        shown += 1
+
+    if shown == 0:
+        lines.append(f"(no findings at or above {min_severity})")
+
+    return "\n".join(lines)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="sovitx-android-audit",
+        description="Own-device Android exposure audit. Termux-native, no root.",
+    )
+    parser.add_argument("--json", action="store_true", help="emit JSON instead of text")
+    parser.add_argument("--out", help="write output to this path")
+    parser.add_argument(
+        "--min-severity", default="LOW",
+        choices=["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"],
+        help="text-mode floor (default LOW)",
+    )
+    parser.add_argument(
+        "--include-system", action="store_true",
+        help="audit system packages too, not just third-party",
+    )
+    parser.add_argument(
+        "--no-sockets", action="store_true",
+        help="skip /proc/net socket collection",
+    )
+    args = parser.parse_args(argv)
+
+    report = build_report(args.include_system)
+    if args.no_sockets:
+        report.sockets = []
+        report.findings = [f for f in report.findings if f.category != "socket"]
+
+    if args.json:
+        payload = json.dumps(asdict(report), indent=2, ensure_ascii=False)
+    else:
+        payload = render_text(report, args.min_severity)
+
+    if args.out:
+        Path(args.out).write_text(payload + "\n", encoding="utf-8")
+
+    sys.stdout.write(payload + "\n")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
